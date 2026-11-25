@@ -126,7 +126,11 @@ def log_orderblocks(symbol: str, market: str, timeframe: str, price: float, obs:
 
 def get_json(url: str, params: dict | None = None):
     response = session.get(url, params=params, timeout=20)
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        detail = response.text[:250] if response is not None else ""
+        raise RuntimeError(f"{exc} | body={detail}") from exc
     return response.json()
 
 
@@ -183,6 +187,7 @@ def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.
     pair = to_coindcx_pair(symbol, market)
     step_sec = timeframe_seconds(timeframe)
     now_sec = int(time.time())
+    from_sec = now_sec - (CANDLES + 20) * step_sec
 
     if market == "SPOT":
         raw = get_json(
@@ -190,12 +195,13 @@ def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.
             params={
                 "pair": pair,
                 "interval": timeframe,
+                "startTime": from_sec * 1000,
+                "endTime": now_sec * 1000,
                 "limit": min(CANDLES + 10, 1000),
             },
         )
     elif market == "FUTURES":
         resolution = to_resolution(timeframe)
-        from_sec = now_sec - (CANDLES + 20) * step_sec
         raw = get_json(
             f"{COINDCX_PUBLIC_URL}/market_data/candlesticks",
             params={
