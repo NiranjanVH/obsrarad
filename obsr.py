@@ -12,6 +12,8 @@ COINDCX_API_URL = "https://api.coindcx.com"
 DEFAULT_SYMBOL = "ZECUSDT"
 TIMEFRAMES = ["5m", "15m"]
 
+SPOT_SUPPORTED_INTERVALS = {"1m", "15m", "1h", "1d"}
+
 CANDLES = 1000
 BARS_BACK = 500
 
@@ -159,7 +161,6 @@ def _parse_candles_payload(raw) -> pd.DataFrame:
             continue
 
         ts_num = float(ts)
-        # Normalize seconds vs milliseconds
         if ts_num > 1e11:
             ts_sec = ts_num / 1000.0
         else:
@@ -183,6 +184,83 @@ def _parse_candles_payload(raw) -> pd.DataFrame:
     return df
 
 
+def _fetch_raw_spot_candles(pair: str, interval: str, from_sec: int, to_sec: int, limit: int) -> pd.DataFrame:
+    raw = get_json(
+        f"{COINDCX_PUBLIC_URL}/market_data/candles",
+        params={
+            "pair": pair,
+            "interval": interval,
+            "startTime": int(from_sec) * 1000,
+            "endTime": int(to_sec) * 1000,
+            "limit": min(int(limit), 1000),
+        },
+    )
+    return _parse_candles_payload(raw)
+
+
+def _fetch_chunked_spot_1m(pair: str, total_1m_needed: int, now_sec: int) -> pd.DataFrame:
+    """Fetch 1m spot candles in <=1000-bar windows moving backward from now_sec."""
+    chunk_size = 1000
+    remaining = max(int(total_1m_needed), 10)
+    cursor_end = now_sec
+    chunks = []
+
+    while remaining > 0:
+        fetch_count = min(remaining, chunk_size)
+        chunk_start = cursor_end - (fetch_count + 5) * 60
+        df_chunk = _fetch_raw_spot_candles(pair, "1m", chunk_start, cursor_end, fetch_count)
+        if df_chunk.empty:
+            break
+
+        chunks.append(df_chunk)
+        earliest_sec = int(df_chunk["time_sec"].min())
+        if earliest_sec >= cursor_end:
+            break
+
+        cursor_end = earliest_sec - 60
+        remaining -= fetch_count
+
+        if len(df_chunk) < 50:
+            break
+
+    if not chunks:
+        return pd.DataFrame(columns=["time", "time_sec", "open", "high", "low", "close", "volume"])
+
+    combined = pd.concat(chunks, ignore_index=True)
+    combined = combined.sort_values("time_sec").drop_duplicates(subset=["time_sec"]).reset_index(drop=True)
+    combined["time"] = pd.to_datetime(combined["time_sec"], unit="s", utc=True)
+    return combined
+
+
+def _resample_spot_from_1m(pair: str, target_tf: str, target_candles: int, now_sec: int) -> pd.DataFrame:
+    step_sec = timeframe_seconds(target_tf)
+    mins_per_bar = max(step_sec // 60, 1)
+    total_1m_needed = (target_candles + 15) * mins_per_bar
+
+    df_1m = _fetch_chunked_spot_1m(pair, total_1m_needed, now_sec)
+    if df_1m.empty:
+        return pd.DataFrame(columns=["time", "time_sec", "open", "high", "low", "close", "volume"])
+
+    # Keep only complete 1m bars prior to the current minute
+    current_1m_start = (now_sec // 60) * 60
+    df_1m = df_1m[df_1m["time_sec"] < current_1m_start].copy()
+    if df_1m.empty:
+        return pd.DataFrame(columns=["time", "time_sec", "open", "high", "low", "close", "volume"])
+
+    rule = f"{mins_per_bar}min"
+    indexed = df_1m.set_index("time")
+    resampled = indexed.resample(rule, origin="epoch", label="left", closed="left").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+    }).dropna(subset=["open", "high", "low", "close"]).reset_index()
+
+    resampled["time_sec"] = resampled["time"].astype("int64") // 10**9
+    return resampled[["time", "time_sec", "open", "high", "low", "close", "volume"]]
+
+
 def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.DataFrame:
     pair = to_coindcx_pair(symbol, market)
     step_sec = timeframe_seconds(timeframe)
@@ -190,16 +268,17 @@ def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.
     from_sec = now_sec - (CANDLES + 20) * step_sec
 
     if market == "SPOT":
-        raw = get_json(
-            f"{COINDCX_PUBLIC_URL}/market_data/candles",
-            params={
-                "pair": pair,
-                "interval": timeframe,
-                "startTime": from_sec * 1000,
-                "endTime": now_sec * 1000,
-                "limit": min(CANDLES + 10, 1000),
-            },
-        )
+        spot_interval = timeframe.lower()
+        if spot_interval in SPOT_SUPPORTED_INTERVALS:
+            df = _fetch_raw_spot_candles(
+                pair,
+                spot_interval,
+                from_sec,
+                now_sec,
+                CANDLES + 10,
+            )
+        else:
+            df = _resample_spot_from_1m(pair, timeframe, CANDLES, now_sec)
     elif market == "FUTURES":
         resolution = to_resolution(timeframe)
         raw = get_json(
@@ -212,10 +291,9 @@ def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.
                 "pcode": "f",
             },
         )
+        df = _parse_candles_payload(raw)
     else:
         raise ValueError(f"Unsupported market: {market}")
-
-    df = _parse_candles_payload(raw)
 
     if df.empty:
         return df
@@ -243,7 +321,6 @@ def get_price(market: str, symbol: str = DEFAULT_SYMBOL) -> float:
         raise ValueError(f"Spot ticker not found for {symbol}")
 
     if market == "FUTURES":
-        # Fetch recent 1m candle to get latest closed/mark price without needing auth
         df = get_klines("FUTURES", "1m", symbol)
         if not df.empty:
             return float(df["close"].iloc[-1])
