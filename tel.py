@@ -1,44 +1,51 @@
 import os
 import requests
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+def get_config(
+    chat_id: str | int | None = None,
+    bot_token: str | None = None,
+) -> tuple[str, str | int]:
+    resolved_token = bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    resolved_chat_id = chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-def validate_configuration() -> None:
-    missing = [
-        name
-        for name, value in (
-            ("TELEGRAM_BOT_TOKEN", BOT_TOKEN),
-            ("TELEGRAM_CHAT_ID", CHAT_ID),
-        )
-        if not value
-    ]
+    missing = []
+    if not resolved_token:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if resolved_chat_id == "":
+        missing.append("TELEGRAM_CHAT_ID")
+
     if missing:
         raise RuntimeError(
             "Missing required environment variable(s): " + ", ".join(missing)
         )
+
+    return resolved_token, resolved_chat_id
+
+
+def validate_configuration() -> None:
+    """Validate that TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set."""
+    get_config()
 
 
 def send_telegram_message(
     text: str,
     chat_id: str | int | None = None,
     bot_token: str | None = None,
+    parse_mode: str | None = None,
 ) -> bool:
-    """Send a plain-text message to Telegram. Returns True if successful."""
+    """Send a message to Telegram. Returns True if successful."""
     if not text:
         return False
 
-    chat_id = chat_id or CHAT_ID
-    bot_token = bot_token or BOT_TOKEN
-    if not chat_id or not bot_token:
-        validate_configuration()
-
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
+    token, target_chat_id = get_config(chat_id=chat_id, bot_token=bot_token)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload: dict[str, str | int] = {
+        "chat_id": target_chat_id,
         "text": text,
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
 
     try:
         response = requests.post(url, json=payload, timeout=15)
@@ -65,6 +72,7 @@ def on_error_occurred(error_detail: str) -> None:
 
 
 if __name__ == "__main__":
+    validate_configuration()
     sent = send_telegram_message("Test message from Python")
     print("Sent:", sent)
     on_order_placed("B-BTC_USDT", "BUY", 92500.0)
