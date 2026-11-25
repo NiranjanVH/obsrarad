@@ -1,4 +1,4 @@
-import os
+import time
 import pandas as pd
 import requests
 
@@ -6,10 +6,10 @@ import requests
 # CONFIGURATION
 # ============================================================
 
-SPOT_URL = "https://data-api.binance.vision"
-FUTURES_URL = "https://fapi.binance.com"
+COINDCX_PUBLIC_URL = "https://public.coindcx.com"
+COINDCX_API_URL = "https://api.coindcx.com"
 
-DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_SYMBOL = "ZECUSDT"
 TIMEFRAMES = ["5m", "15m"]
 
 CANDLES = 1000
@@ -24,94 +24,204 @@ FVG_DISTANCE = 3
 LINE_HEIGHT = "Body"
 MAX_OBS = 4
 
-# Optional proxy for Binance Futures (e.g. socks5h://user:pass@host:port or http://host:port)
-FUTURES_PROXY = os.getenv("FUTURES_PROXY", "").strip() or None
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "CoinDCX-OB-Scanner/1.0"
+})
 
-spot_session = requests.Session()
-spot_session.headers.update({"User-Agent": "MultiCoin-OB-Scanner/1.0"})
+RESOLUTION_MAP = {
+    "1m": "1",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "1H": "60",
+    "4h": "240",
+    "4H": "240",
+    "1d": "1D",
+    "1D": "1D",
+}
 
-futures_session = requests.Session()
-futures_session.headers.update({"User-Agent": "MultiCoin-OB-Scanner/1.0"})
-if FUTURES_PROXY:
-    futures_session.proxies.update({
-        "http": FUTURES_PROXY,
-        "https": FUTURES_PROXY,
-    })
+INTERVAL_SECONDS = {
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "1H": 3600,
+    "4h": 14400,
+    "4H": 14400,
+    "1d": 86400,
+    "1D": 86400,
+}
 
 
 # ============================================================
-# BINANCE API
+# PAIR & TIMEFRAME HELPERS
 # ============================================================
 
-def _get_client(market: str):
-    if market == "SPOT":
-        return spot_session, SPOT_URL, "/api/v3"
+def to_coindcx_pair(symbol: str, market: str) -> str:
+    clean = symbol.upper().replace("-", "").replace("_", "")
+    if clean.endswith("USDT"):
+        base = clean[:-4]
+        quote = "USDT"
+    elif clean.endswith("INR"):
+        base = clean[:-3]
+        quote = "INR"
+    else:
+        base = clean
+        quote = "USDT"
+
     if market == "FUTURES":
-        return futures_session, FUTURES_URL, "/fapi/v1"
+        return f"B-{base}_{quote}"
+    if market == "SPOT":
+        return f"KC-{base}_{quote}"
     raise ValueError(f"Unsupported market: {market}")
 
 
-def get_json(session: requests.Session, url: str, params: dict | None = None):
+def to_resolution(timeframe: str) -> str:
+    if timeframe in RESOLUTION_MAP:
+        return RESOLUTION_MAP[timeframe]
+    if timeframe.endswith("m") and timeframe[:-1].isdigit():
+        return timeframe[:-1]
+    if timeframe.endswith("h") and timeframe[:-1].isdigit():
+        return str(int(timeframe[:-1]) * 60)
+    if timeframe.endswith("d") and timeframe[:-1].isdigit():
+        return f"{timeframe[:-1]}D"
+    raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+
+def timeframe_seconds(timeframe: str) -> int:
+    if timeframe in INTERVAL_SECONDS:
+        return INTERVAL_SECONDS[timeframe]
+    if timeframe.endswith("m") and timeframe[:-1].isdigit():
+        return int(timeframe[:-1]) * 60
+    if timeframe.endswith("h") and timeframe[:-1].isdigit():
+        return int(timeframe[:-1]) * 3600
+    if timeframe.endswith("d") and timeframe[:-1].isdigit():
+        return int(timeframe[:-1]) * 86400
+    return 300
+
+
+# ============================================================
+# COINDCX API
+# ============================================================
+
+def get_json(url: str, params: dict | None = None):
     response = session.get(url, params=params, timeout=20)
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        if status == 451:
-            raise RuntimeError(f"HTTP 451 (blocked by IP/region) for {url}") from exc
-        raise
+    response.raise_for_status()
     return response.json()
 
 
+def _parse_candles_payload(raw) -> pd.DataFrame:
+    if isinstance(raw, dict):
+        rows = raw.get("data") or raw.get("candles") or []
+    else:
+        rows = raw or []
+
+    if not rows:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+
+    records = []
+    for item in rows:
+        if isinstance(item, dict):
+            ts = item.get("time") or item.get("timestamp") or item.get("t")
+            o = item.get("open") or item.get("o")
+            h = item.get("high") or item.get("h")
+            l = item.get("low") or item.get("l")
+            c = item.get("close") or item.get("c")
+            v = item.get("volume") or item.get("v") or 0
+        elif isinstance(item, (list, tuple)) and len(item) >= 5:
+            ts, o, h, l, c = item[:5]
+            v = item[5] if len(item) > 5 else 0
+        else:
+            continue
+
+        ts_num = float(ts)
+        # Normalize seconds vs milliseconds
+        if ts_num > 1e11:
+            ts_sec = ts_num / 1000.0
+        else:
+            ts_sec = ts_num
+
+        records.append({
+            "time_sec": ts_sec,
+            "open": float(o),
+            "high": float(h),
+            "low": float(l),
+            "close": float(c),
+            "volume": float(v),
+        })
+
+    if not records:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(records)
+    df = df.sort_values("time_sec").drop_duplicates(subset=["time_sec"]).reset_index(drop=True)
+    df["time"] = pd.to_datetime(df["time_sec"], unit="s", utc=True)
+    return df
+
+
 def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.DataFrame:
-    sess, base_url, prefix = _get_client(market)
-    data = get_json(
-        sess,
-        f"{base_url}{prefix}/klines",
-        {
-            "symbol": symbol,
-            "interval": timeframe,
-            "limit": CANDLES,
-        },
-    )
+    pair = to_coindcx_pair(symbol, market)
+    resolution = to_resolution(timeframe)
+    step_sec = timeframe_seconds(timeframe)
 
-    columns = [
-        "time", "open", "high", "low", "close",
-        "volume", "close_time", "quote_volume",
-        "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore",
-    ]
+    now_sec = int(time.time())
+    from_sec = now_sec - (CANDLES + 20) * step_sec
 
-    df = pd.DataFrame(data, columns=columns)
+    params = {
+        "pair": pair,
+        "from": from_sec,
+        "to": now_sec,
+        "resolution": resolution,
+    }
+    if market == "FUTURES":
+        params["pcode"] = "f"
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col])
+    raw = get_json(f"{COINDCX_PUBLIC_URL}/market_data/candlesticks", params=params)
+    df = _parse_candles_payload(raw)
 
-    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_numeric(df["close_time"])
+    if df.empty:
+        return df
 
-    now_ms = int(pd.Timestamp.now(tz="UTC").timestamp() * 1000)
+    # Remove unfinished candle (open time still within current interval)
+    current_bar_start = (now_sec // step_sec) * step_sec
+    df = df[df["time_sec"] < current_bar_start].copy()
 
-    # Remove unfinished candle
-    df = df[df["close_time"] < now_ms].reset_index(drop=True)
+    if len(df) > CANDLES:
+        df = df.tail(CANDLES)
+
+    df = df.drop(columns=["time_sec"]).reset_index(drop=True)
     return df
 
 
 def get_price(market: str, symbol: str = DEFAULT_SYMBOL) -> float:
-    sess, base_url, prefix = _get_client(market)
-    data = get_json(
-        sess,
-        f"{base_url}{prefix}/ticker/price",
-        {"symbol": symbol},
-    )
-    return float(data["price"])
+    if market == "SPOT":
+        target_pair = to_coindcx_pair(symbol, "SPOT")
+        tickers = get_json(f"{COINDCX_API_URL}/exchange/ticker")
+        if isinstance(tickers, list):
+            for t in tickers:
+                m = str(t.get("market", "")).upper()
+                if m in (target_pair, symbol.upper()):
+                    return float(t["last_price"])
+        raise ValueError(f"Spot ticker not found for {symbol}")
+
+    if market == "FUTURES":
+        # Fetch recent 1m candle to get latest closed/mark price without needing auth
+        df = get_klines("FUTURES", "1m", symbol)
+        if not df.empty:
+            return float(df["close"].iloc[-1])
+        raise ValueError(f"Futures price unavailable for {symbol}")
+
+    raise ValueError(f"Unsupported market: {market}")
 
 
 # ============================================================
 # FRACTAL DETECTION
 # ============================================================
 
-def fractal_high(df: pd.DataFrame, i: int) -> bool:
+def fractal_high(df, i):
     if FRACTAL_FILTER == "3":
         if i < 3:
             return False
@@ -136,7 +246,7 @@ def fractal_high(df: pd.DataFrame, i: int) -> bool:
     )
 
 
-def fractal_low(df: pd.DataFrame, i: int) -> bool:
+def fractal_low(df, i):
     if FRACTAL_FILTER == "3":
         if i < 3:
             return False
@@ -165,23 +275,24 @@ def fractal_low(df: pd.DataFrame, i: int) -> bool:
 # ORDER BLOCK DETECTION
 # ============================================================
 
-def find_orderblocks(df: pd.DataFrame):
+def find_orderblocks(df):
     fractal_highs = []
     fractal_lows = []
     active_obs = []
+
     shift = 1 if FRACTAL_FILTER == "3" else 2
 
     for i in range(len(df)):
         if fractal_high(df, i):
             fractal_highs.append({
                 "index": i - shift,
-                "price": float(df.high.iloc[i - shift]),
+                "price": float(df.high.iloc[i - shift])
             })
 
         if fractal_low(df, i):
             fractal_lows.append({
                 "index": i - shift,
-                "price": float(df.low.iloc[i - shift]),
+                "price": float(df.low.iloc[i - shift])
             })
 
         # ----------------------------------------------------
@@ -220,7 +331,10 @@ def find_orderblocks(df: pd.DataFrame):
                 if bearish_gap and df.high.iloc[j] > highest_price:
                     gap_index = k + 2
 
-            valid_fvg = gap_index > 0 and 0 <= idx - gap_index <= FVG_DISTANCE
+            valid_fvg = (
+                gap_index > 0
+                and 0 <= idx - gap_index <= FVG_DISTANCE
+            )
             if not FILTER_FVGS:
                 valid_fvg = True
 
@@ -236,7 +350,7 @@ def find_orderblocks(df: pd.DataFrame):
                     "type": "BEARISH",
                     "top": top,
                     "bottom": bottom,
-                    "index": ob_index,
+                    "index": ob_index
                 })
 
             fractal_lows.pop(p)
@@ -277,7 +391,10 @@ def find_orderblocks(df: pd.DataFrame):
                 if bullish_gap:
                     gap_index = k + 2
 
-            valid_fvg = gap_index > 0 and 0 <= idx - gap_index <= FVG_DISTANCE
+            valid_fvg = (
+                gap_index > 0
+                and 0 <= idx - gap_index <= FVG_DISTANCE
+            )
             if not FILTER_FVGS:
                 valid_fvg = True
 
@@ -293,7 +410,7 @@ def find_orderblocks(df: pd.DataFrame):
                     "type": "BULLISH",
                     "top": top,
                     "bottom": bottom,
-                    "index": ob_index,
+                    "index": ob_index
                 })
 
             fractal_highs.pop(p)
@@ -303,13 +420,14 @@ def find_orderblocks(df: pd.DataFrame):
         # ----------------------------------------------------
         remaining = []
         for ob in active_obs:
-            filled = (
-                df.high.iloc[i] >= ob["top"]
-                if ob["type"] == "BEARISH"
-                else df.low.iloc[i] <= ob["bottom"]
-            )
+            if ob["type"] == "BEARISH":
+                filled = df.high.iloc[i] >= ob["top"]
+            else:
+                filled = df.low.iloc[i] <= ob["bottom"]
+
             if not filled:
                 remaining.append(ob)
+
         active_obs = remaining
 
     active_obs.sort(key=lambda x: x["index"], reverse=True)
@@ -317,7 +435,11 @@ def find_orderblocks(df: pd.DataFrame):
     unique_obs = []
     seen = set()
     for ob in active_obs:
-        key = (ob["type"], round(ob["top"], 4), round(ob["bottom"], 4))
+        key = (
+            ob["type"],
+            round(ob["top"], 4),
+            round(ob["bottom"], 4)
+        )
         if key not in seen:
             seen.add(key)
             unique_obs.append(ob)
@@ -329,11 +451,12 @@ def find_orderblocks(df: pd.DataFrame):
 # DISTANCE CALCULATION
 # ============================================================
 
-def get_distance(price: float, ob: dict) -> dict:
+def get_distance(price, ob):
     top = float(ob["top"])
     bottom = float(ob["bottom"])
+
     zone_height = top - bottom
-    zone_size_pct = (zone_height / top * 100) if top else 0.0
+    zone_size_pct = (zone_height / top * 100) if top else 0
 
     if price > top:
         points = price - top
@@ -348,14 +471,14 @@ def get_distance(price: float, ob: dict) -> dict:
         reference = price
         position = "INSIDE ZONE"
 
-    distance_pct = (points / reference * 100) if reference else 0.0
+    distance_pct = (points / reference * 100) if reference else 0
 
     return {
         "distance_points": points,
         "distance_pct": distance_pct,
         "zone_height": zone_height,
         "zone_size_pct": zone_size_pct,
-        "position": position,
+        "position": position
     }
 
 
@@ -363,9 +486,10 @@ def get_distance(price: float, ob: dict) -> dict:
 # REUSABLE SCANNER METHOD FOR obr.py
 # ============================================================
 
-def scan_symbol(symbol: str, include_spot: bool = True) -> dict:
+def scan_symbol(symbol, include_spot=True):
     results = []
     prices = {}
+
     markets = ["SPOT", "FUTURES"] if include_spot else ["FUTURES"]
 
     for market in markets:
@@ -383,6 +507,7 @@ def scan_symbol(symbol: str, include_spot: bool = True) -> dict:
 
                 for ob in obs:
                     distance = get_distance(price, ob)
+
                     results.append({
                         "SYMBOL": symbol,
                         "MARKET": market,
@@ -395,15 +520,16 @@ def scan_symbol(symbol: str, include_spot: bool = True) -> dict:
                         "DISTANCE (%)": float(distance["distance_pct"]),
                         "ZONE HEIGHT": float(distance["zone_height"]),
                         "ZONE SIZE (%)": float(distance["zone_size_pct"]),
-                        "POSITION": distance["position"],
+                        "POSITION": distance["position"]
                     })
+
             except Exception as e:
                 print(f"{symbol} {market} {timeframe} ERROR: {e}")
 
     return {
         "symbol": symbol,
         "prices": prices,
-        "order_blocks": results,
+        "order_blocks": results
     }
 
 
@@ -413,8 +539,7 @@ def scan_symbol(symbol: str, include_spot: bool = True) -> dict:
 
 def main():
     results = []
-    print("\nFetching Binance market data...")
-    print(f"Futures Proxy: {'ENABLED' if FUTURES_PROXY else 'NONE (direct)'}")
+    print("\nFetching CoinDCX market data...")
 
     for market in ["SPOT", "FUTURES"]:
         try:
@@ -441,7 +566,7 @@ def main():
                         "DISTANCE (%)": "-",
                         "ZONE HEIGHT": "-",
                         "ZONE SIZE (%)": "-",
-                        "POSITION": "NO OPEN OB",
+                        "POSITION": "NO OPEN OB"
                     })
                     continue
 
@@ -458,14 +583,15 @@ def main():
                         "DISTANCE (%)": round(distance["distance_pct"], 3),
                         "ZONE HEIGHT": round(distance["zone_height"], 4),
                         "ZONE SIZE (%)": round(distance["zone_size_pct"], 3),
-                        "POSITION": distance["position"],
+                        "POSITION": distance["position"]
                     })
+
             except Exception as e:
                 print(f"ERROR: {market} {timeframe}: {e}")
 
     print("\n")
     print("=" * 150)
-    print(f"                    {DEFAULT_SYMBOL} OPEN ORDER BLOCK SCANNER")
+    print(f"                    {DEFAULT_SYMBOL} OPEN ORDER BLOCK SCANNER (COINDCX)")
     print("=" * 150)
 
     if results:
