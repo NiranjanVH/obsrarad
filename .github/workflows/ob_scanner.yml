@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+  repository_dispatch:
+    types: [run_coinglass]
 
 jobs:
   run-scanner:
@@ -26,5 +28,5 @@ jobs:
         env:
           FUTURES_PROXY: ${{ secrets.FUTURES_PROXY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_BOT_ID }}
         run: python obr.py
