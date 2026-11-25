@@ -103,6 +103,23 @@ def timeframe_seconds(timeframe: str) -> int:
     return 300
 
 
+def log_orderblocks(symbol: str, market: str, timeframe: str, price: float, obs: list[dict]) -> None:
+    if not obs:
+        print(f"  [{symbol} | {market} | {timeframe}] No open OBs found (price={price:.4f})")
+        return
+
+    print(f"  [{symbol} | {market} | {timeframe}] Found {len(obs)} open OB(s) (price={price:.4f}):")
+    for idx, ob in enumerate(obs, start=1):
+        dist = get_distance(price, ob)
+        print(
+            f"    #{idx} {ob['type']} OB | "
+            f"Range: [{ob['bottom']:.4f} -> {ob['top']:.4f}] | "
+            f"Idx: {ob['index']} | "
+            f"Pos: {dist['position']} | "
+            f"Dist: {dist['distance_points']:.4f} ({dist['distance_pct']:.3f}%)"
+        )
+
+
 # ============================================================
 # COINDCX API
 # ============================================================
@@ -164,22 +181,34 @@ def _parse_candles_payload(raw) -> pd.DataFrame:
 
 def get_klines(market: str, timeframe: str, symbol: str = DEFAULT_SYMBOL) -> pd.DataFrame:
     pair = to_coindcx_pair(symbol, market)
-    resolution = to_resolution(timeframe)
     step_sec = timeframe_seconds(timeframe)
-
     now_sec = int(time.time())
-    from_sec = now_sec - (CANDLES + 20) * step_sec
 
-    params = {
-        "pair": pair,
-        "from": from_sec,
-        "to": now_sec,
-        "resolution": resolution,
-    }
-    if market == "FUTURES":
-        params["pcode"] = "f"
+    if market == "SPOT":
+        raw = get_json(
+            f"{COINDCX_PUBLIC_URL}/market_data/candles",
+            params={
+                "pair": pair,
+                "interval": timeframe,
+                "limit": min(CANDLES + 10, 1000),
+            },
+        )
+    elif market == "FUTURES":
+        resolution = to_resolution(timeframe)
+        from_sec = now_sec - (CANDLES + 20) * step_sec
+        raw = get_json(
+            f"{COINDCX_PUBLIC_URL}/market_data/candlesticks",
+            params={
+                "pair": pair,
+                "from": from_sec,
+                "to": now_sec,
+                "resolution": resolution,
+                "pcode": "f",
+            },
+        )
+    else:
+        raise ValueError(f"Unsupported market: {market}")
 
-    raw = get_json(f"{COINDCX_PUBLIC_URL}/market_data/candlesticks", params=params)
     df = _parse_candles_payload(raw)
 
     if df.empty:
@@ -496,14 +525,16 @@ def scan_symbol(symbol, include_spot=True):
         try:
             price = get_price(market, symbol)
             prices[market] = price
+            print(f"[{symbol}] {market} PRICE: {price:.4f}")
         except Exception as e:
-            print(f"{symbol} {market} PRICE ERROR: {e}")
+            print(f"[{symbol}] {market} PRICE ERROR: {e}")
             continue
 
         for timeframe in TIMEFRAMES:
             try:
                 df = get_klines(market, timeframe, symbol)
                 obs = find_orderblocks(df)
+                log_orderblocks(symbol, market, timeframe, price, obs)
 
                 for ob in obs:
                     distance = get_distance(price, ob)
@@ -524,7 +555,7 @@ def scan_symbol(symbol, include_spot=True):
                     })
 
             except Exception as e:
-                print(f"{symbol} {market} {timeframe} ERROR: {e}")
+                print(f"[{symbol}] {market} {timeframe} ERROR: {e}")
 
     return {
         "symbol": symbol,
@@ -553,6 +584,7 @@ def main():
             try:
                 df = get_klines(market, timeframe, DEFAULT_SYMBOL)
                 obs = find_orderblocks(df)
+                log_orderblocks(DEFAULT_SYMBOL, market, timeframe, price, obs)
 
                 if not obs:
                     results.append({
