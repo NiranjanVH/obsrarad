@@ -23,7 +23,7 @@ FIND_OB_TYPE = "Close"
 FILTER_FVGS = True
 FVG_DISTANCE = 3
 
-LINE_HEIGHT = "Body"
+LINE_HEIGHT = "Wick"
 MAX_OBS = 4
 
 session = requests.Session()
@@ -452,12 +452,18 @@ def find_orderblocks(df):
 
             if idx != 0 and valid_fvg:
                 ob_index = i - idx
-                top = float(df.high.iloc[ob_index])
-                bottom = (
-                    float(df.open.iloc[ob_index])
-                    if LINE_HEIGHT == "Body"
-                    else float(df.low.iloc[ob_index])
-                )
+                o = float(df.open.iloc[ob_index])
+                h = float(df.high.iloc[ob_index])
+                l = float(df.low.iloc[ob_index])
+                c = float(df.close.iloc[ob_index])
+
+                if LINE_HEIGHT == "Wick":
+                    top = h
+                    bottom = l
+                else:
+                    top = max(o, c)
+                    bottom = min(o, c)
+
                 active_obs.append({
                     "type": "BEARISH",
                     "top": top,
@@ -512,12 +518,18 @@ def find_orderblocks(df):
 
             if idx != 0 and valid_fvg:
                 ob_index = i - idx
-                bottom = float(df.low.iloc[ob_index])
-                top = (
-                    float(df.open.iloc[ob_index])
-                    if LINE_HEIGHT == "Body"
-                    else float(df.high.iloc[ob_index])
-                )
+                o = float(df.open.iloc[ob_index])
+                h = float(df.high.iloc[ob_index])
+                l = float(df.low.iloc[ob_index])
+                c = float(df.close.iloc[ob_index])
+
+                if LINE_HEIGHT == "Wick":
+                    top = h
+                    bottom = l
+                else:
+                    top = max(o, c)
+                    bottom = min(o, c)
+
                 active_obs.append({
                     "type": "BULLISH",
                     "top": top,
@@ -651,73 +663,5 @@ def scan_symbol(symbol, include_spot=True):
 # MAIN SCANNER
 # ============================================================
 
-def main():
-    results = []
-    print("\nFetching CoinDCX market data...")
-
-    for market in ["SPOT", "FUTURES"]:
-        try:
-            price = get_price(market, DEFAULT_SYMBOL)
-            print(f"{market} PRICE ({DEFAULT_SYMBOL}): {price:,.4f}")
-        except Exception as e:
-            print(f"{market} ERROR: {e}")
-            continue
-
-        for timeframe in TIMEFRAMES:
-            try:
-                df = get_klines(market, timeframe, DEFAULT_SYMBOL)
-                obs = find_orderblocks(df)
-                log_orderblocks(DEFAULT_SYMBOL, market, timeframe, price, obs)
-
-                if not obs:
-                    results.append({
-                        "MARKET": market,
-                        "TF": timeframe,
-                        "TYPE": "NONE",
-                        "TOP": "-",
-                        "BOTTOM": "-",
-                        "PRICE": round(price, 4),
-                        "DISTANCE (POINTS)": "-",
-                        "DISTANCE (%)": "-",
-                        "ZONE HEIGHT": "-",
-                        "ZONE SIZE (%)": "-",
-                        "POSITION": "NO OPEN OB"
-                    })
-                    continue
-
-                for ob in obs:
-                    distance = get_distance(price, ob)
-                    results.append({
-                        "MARKET": market,
-                        "TF": timeframe,
-                        "TYPE": ob["type"],
-                        "TOP": round(ob["top"], 4),
-                        "BOTTOM": round(ob["bottom"], 4),
-                        "PRICE": round(price, 4),
-                        "DISTANCE (POINTS)": round(distance["distance_points"], 4),
-                        "DISTANCE (%)": round(distance["distance_pct"], 3),
-                        "ZONE HEIGHT": round(distance["zone_height"], 4),
-                        "ZONE SIZE (%)": round(distance["zone_size_pct"], 3),
-                        "POSITION": distance["position"]
-                    })
-
-            except Exception as e:
-                print(f"ERROR: {market} {timeframe}: {e}")
-
-    print("\n")
-    print("=" * 150)
-    print(f"                    {DEFAULT_SYMBOL} OPEN ORDER BLOCK SCANNER (COINDCX)")
-    print("=" * 150)
-
-    if results:
-        table = pd.DataFrame(results)
-        print(table.to_string(index=False, justify="center"))
-    else:
-        print("No market data available.")
-
-    print("=" * 150)
-    print("SCAN COMPLETED")
-
-
 if __name__ == "__main__":
-    main()
+    scan_symbol(DEFAULT_SYMBOL, include_spot=True)
