@@ -10,7 +10,7 @@ COINDCX_PUBLIC_URL = "https://public.coindcx.com"
 COINDCX_API_URL = "https://api.coindcx.com"
 
 DEFAULT_SYMBOL = "ZECUSDT"
-TIMEFRAMES = ["5m", "15m"]
+TIMEFRAMES = ["15m", "1h"]
 
 SPOT_SUPPORTED_INTERVALS = {"1m", "15m", "1h", "1d"}
 
